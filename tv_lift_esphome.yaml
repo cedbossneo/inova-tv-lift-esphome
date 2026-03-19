@@ -1,0 +1,366 @@
+##############################################################
+# ESPHome BLE configuration for I-NOVA TV Lift
+# Protocol reverse-engineered from I-NOVA 1.7 Android APK
+#
+# BLE Protocol:
+#   Service UUID:   0000fee0-0000-1000-8000-00805f9b34fb
+#   Write Char:     0000fee2-0000-1000-8000-00805f9b34fb  (commands)
+#   Notify Char:    0000fee1-0000-1000-8000-00805f9b34fb  (responses)
+#
+# Command format: A5 <len> <cmd> <checksum>
+#   UP:   A5 03 12 15
+#   DOWN: A5 03 14 17
+#   STOP: A5 03 10 13
+#   GOTO: A5 05 31 <height*10 high byte> <height*10 low byte> <checksum>
+#         checksum = (05 + 31 + HH + LL) & 0xFF
+#
+# BLE device discovery:
+#   On boot, the ESP32 scans for devices advertising service 0000FEE0.
+#   The first device found is auto-saved as the configured MAC.
+#   You can also set the MAC manually via the "TV Lift BLE Address" text
+#   entity in HA. The device reboots automatically when MAC changes.
+##############################################################
+
+substitutions:
+  device_name: tv-lift
+  friendly_name: "TV Lift"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    priority: -100
+    then:
+      - lambda: |-
+          // Load saved MAC from globals into the ble_client at boot
+          std::string mac = id(saved_mac);
+          if (mac.length() == 17 && mac != "none") {
+            ESP_LOGI("tv_lift", "Saved BLE MAC: %s — will connect", mac.c_str());
+            // Parse MAC string to uint64_t for ble_client
+            uint64_t addr = 0;
+            for (int i = 0; i < 6; i++) {
+              addr <<= 8;
+              addr |= strtoul(mac.substr(i * 3, 2).c_str(), nullptr, 16);
+            }
+            id(tv_lift_ble).set_address(addr);
+            id(tv_lift_ble).set_enabled(true);
+          } else {
+            ESP_LOGI("tv_lift", "No BLE MAC configured — scanning for I-NOVA devices...");
+            id(tv_lift_ble).set_enabled(false);
+          }
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+logger:
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+api:
+
+wifi:
+  ap:
+    ssid: "${friendly_name} Setup"
+    password: !secret ap_password
+
+captive_portal:
+
+# WiFi provisioning: if no WiFi is configured or saved network is
+# unavailable, the ESP32 creates an AP named "TV Lift Setup".
+# Connect to it -> captive portal opens -> enter your WiFi credentials.
+# Credentials are saved and reused on subsequent boots.
+
+##############################################################
+# BLE Scanner & Client
+##############################################################
+esp32_ble_tracker:
+  scan_parameters:
+    active: true
+    interval: 320ms
+    window: 100ms
+  on_ble_advertise:
+    - then:
+        - lambda: |-
+            for (auto &srv : x.get_service_uuids()) {
+              if (srv == esp32_ble_tracker::ESPBTUUID::from_uint16(0xFEE0)) {
+                std::string mac = x.address_str();
+                int rssi = x.get_rssi();
+                ESP_LOGI("tv_lift", "Discovered I-NOVA: %s (RSSI: %d)", mac.c_str(), rssi);
+                id(discovered_device).publish_state(mac);
+                // Auto-configure if no MAC is saved yet
+                std::string saved = id(saved_mac);
+                if (saved.empty() || saved == "none" || saved.length() != 17) {
+                  ESP_LOGI("tv_lift", "Auto-selecting: %s", mac.c_str());
+                  id(saved_mac) = mac;
+                  id(configured_mac).publish_state(mac);
+                  // Reboot to apply
+                  App.safe_reboot();
+                }
+                break;
+              }
+            }
+
+ble_client:
+  - mac_address: "00:00:00:00:00:00"
+    id: tv_lift_ble
+    auto_connect: true
+    on_connect:
+      then:
+        - logger.log: "TV Lift BLE connected"
+        - lambda: |-
+            id(tv_lift_connected) = true;
+    on_disconnect:
+      then:
+        - logger.log: "TV Lift BLE disconnected"
+        - lambda: |-
+            id(tv_lift_connected) = false;
+
+##############################################################
+# Global state
+##############################################################
+globals:
+  - id: tv_lift_connected
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: target_height
+    type: float
+    restore_value: false
+    initial_value: "0"
+  - id: saved_mac
+    type: std::string
+    restore_value: true
+    initial_value: '"none"'
+
+##############################################################
+# Text entities for BLE device management
+##############################################################
+text_sensor:
+  - platform: template
+    name: "TV Lift Discovered Device"
+    id: discovered_device
+    icon: "mdi:bluetooth-searching"
+
+text:
+  - platform: template
+    name: "TV Lift BLE Address"
+    id: configured_mac
+    icon: "mdi:bluetooth-connect"
+    mode: text
+    min_length: 0
+    max_length: 17
+    initial_value: "none"
+    restore_value: true
+    optimistic: true
+    on_value:
+      then:
+        - lambda: |-
+            if (x.length() == 17 && x != "none" && x != id(saved_mac)) {
+              ESP_LOGI("tv_lift", "New BLE MAC configured: %s — rebooting to apply", x.c_str());
+              id(saved_mac) = x;
+              // Reboot so ble_client picks up the new address
+              App.safe_reboot();
+            }
+
+##############################################################
+# Binary sensor — connection status
+##############################################################
+binary_sensor:
+  - platform: template
+    name: "TV Lift Connected"
+    id: lift_connected_sensor
+    lambda: return id(tv_lift_connected);
+    device_class: connectivity
+
+##############################################################
+# Buttons — exposed to Home Assistant
+##############################################################
+button:
+  - platform: template
+    name: "TV Lift Up"
+    id: btn_up
+    icon: "mdi:arrow-up-bold"
+    on_press:
+      - lambda: "id(target_height) = id(height_upper_limit).state;"
+      - ble_client.ble_write:
+          id: tv_lift_ble
+          service_uuid: "0000fee0-0000-1000-8000-00805f9b34fb"
+          characteristic_uuid: "0000fee2-0000-1000-8000-00805f9b34fb"
+          value: !lambda |-
+            int val = (int)(id(target_height) * 10);
+            uint8_t hh = (val >> 8) & 0xFF;
+            uint8_t ll = val & 0xFF;
+            uint8_t cs = (0x05 + 0x31 + hh + ll) & 0xFF;
+            ESP_LOGI("tv_lift", "UP (to upper limit %.1f cm)", id(target_height));
+            return {0xA5, 0x05, 0x31, hh, ll, cs};
+
+  - platform: template
+    name: "TV Lift Down"
+    id: btn_down
+    icon: "mdi:arrow-down-bold"
+    on_press:
+      - lambda: "id(target_height) = id(height_lower_limit).state;"
+      - ble_client.ble_write:
+          id: tv_lift_ble
+          service_uuid: "0000fee0-0000-1000-8000-00805f9b34fb"
+          characteristic_uuid: "0000fee2-0000-1000-8000-00805f9b34fb"
+          value: !lambda |-
+            int val = (int)(id(target_height) * 10);
+            uint8_t hh = (val >> 8) & 0xFF;
+            uint8_t ll = val & 0xFF;
+            uint8_t cs = (0x05 + 0x31 + hh + ll) & 0xFF;
+            ESP_LOGI("tv_lift", "DOWN (to lower limit %.1f cm)", id(target_height));
+            return {0xA5, 0x05, 0x31, hh, ll, cs};
+
+  - platform: template
+    name: "TV Lift Stop"
+    id: btn_stop
+    icon: "mdi:stop"
+    on_press:
+      - logger.log: "Sending STOP command: A5 03 10 13"
+      - ble_client.ble_write:
+          id: tv_lift_ble
+          service_uuid: "0000fee0-0000-1000-8000-00805f9b34fb"
+          characteristic_uuid: "0000fee2-0000-1000-8000-00805f9b34fb"
+          value: [0xA5, 0x03, 0x10, 0x13]
+
+  # Program buttons — read height from number entity and send BLE command
+  - platform: template
+    name: "TV Lift Program 1"
+    id: btn_program_1
+    icon: "mdi:numeric-1-box"
+    on_press:
+      - lambda: "id(target_height) = id(program_1_height).state;"
+      - ble_client.ble_write:
+          id: tv_lift_ble
+          service_uuid: "0000fee0-0000-1000-8000-00805f9b34fb"
+          characteristic_uuid: "0000fee2-0000-1000-8000-00805f9b34fb"
+          value: !lambda |-
+            int val = (int)(id(target_height) * 10);
+            uint8_t hh = (val >> 8) & 0xFF;
+            uint8_t ll = val & 0xFF;
+            uint8_t cs = (0x05 + 0x31 + hh + ll) & 0xFF;
+            ESP_LOGI("tv_lift", "Program 1: %.1f cm", id(target_height));
+            return {0xA5, 0x05, 0x31, hh, ll, cs};
+
+  - platform: template
+    name: "TV Lift Program 2"
+    id: btn_program_2
+    icon: "mdi:numeric-2-box"
+    on_press:
+      - lambda: "id(target_height) = id(program_2_height).state;"
+      - ble_client.ble_write:
+          id: tv_lift_ble
+          service_uuid: "0000fee0-0000-1000-8000-00805f9b34fb"
+          characteristic_uuid: "0000fee2-0000-1000-8000-00805f9b34fb"
+          value: !lambda |-
+            int val = (int)(id(target_height) * 10);
+            uint8_t hh = (val >> 8) & 0xFF;
+            uint8_t ll = val & 0xFF;
+            uint8_t cs = (0x05 + 0x31 + hh + ll) & 0xFF;
+            ESP_LOGI("tv_lift", "Program 2: %.1f cm", id(target_height));
+            return {0xA5, 0x05, 0x31, hh, ll, cs};
+
+  - platform: template
+    name: "TV Lift Program 3"
+    id: btn_program_3
+    icon: "mdi:numeric-3-box"
+    on_press:
+      - lambda: "id(target_height) = id(program_3_height).state;"
+      - ble_client.ble_write:
+          id: tv_lift_ble
+          service_uuid: "0000fee0-0000-1000-8000-00805f9b34fb"
+          characteristic_uuid: "0000fee2-0000-1000-8000-00805f9b34fb"
+          value: !lambda |-
+            int val = (int)(id(target_height) * 10);
+            uint8_t hh = (val >> 8) & 0xFF;
+            uint8_t ll = val & 0xFF;
+            uint8_t cs = (0x05 + 0x31 + hh + ll) & 0xFF;
+            ESP_LOGI("tv_lift", "Program 3: %.1f cm", id(target_height));
+            return {0xA5, 0x05, 0x31, hh, ll, cs};
+
+##############################################################
+# Height limits & program heights — adjustable from HA
+# Values persist across reboots (restore_value: true)
+##############################################################
+number:
+  - platform: template
+    name: "TV Lift Upper Limit"
+    id: height_upper_limit
+    icon: "mdi:arrow-collapse-up"
+    unit_of_measurement: "cm"
+    min_value: 60
+    max_value: 200
+    step: 0.5
+    initial_value: 200
+    restore_value: true
+    optimistic: true
+
+  - platform: template
+    name: "TV Lift Lower Limit"
+    id: height_lower_limit
+    icon: "mdi:arrow-collapse-down"
+    unit_of_measurement: "cm"
+    min_value: 60
+    max_value: 200
+    step: 0.5
+    initial_value: 60
+    restore_value: true
+    optimistic: true
+
+  - platform: template
+    name: "TV Lift Program 1 Height"
+    id: program_1_height
+    icon: "mdi:numeric-1-box-outline"
+    unit_of_measurement: "cm"
+    min_value: 60
+    max_value: 200
+    step: 0.5
+    initial_value: 93.5
+    restore_value: true
+    optimistic: true
+
+  - platform: template
+    name: "TV Lift Program 2 Height"
+    id: program_2_height
+    icon: "mdi:numeric-2-box-outline"
+    unit_of_measurement: "cm"
+    min_value: 60
+    max_value: 200
+    step: 0.5
+    initial_value: 181
+    restore_value: true
+    optimistic: true
+
+  - platform: template
+    name: "TV Lift Program 3 Height"
+    id: program_3_height
+    icon: "mdi:numeric-3-box-outline"
+    unit_of_measurement: "cm"
+    min_value: 60
+    max_value: 200
+    step: 0.5
+    initial_value: 130
+    restore_value: true
+    optimistic: true
+
+##############################################################
+# Cover entity — gives HA a proper cover card
+# with Up/Down/Stop controls
+##############################################################
+cover:
+  - platform: template
+    name: "TV Lift"
+    id: tv_lift_cover
+    device_class: blind
+    optimistic: true
+    open_action:
+      - button.press: btn_up
+    close_action:
+      - button.press: btn_down
+    stop_action:
+      - button.press: btn_stop
