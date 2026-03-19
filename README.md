@@ -8,9 +8,11 @@ The BLE protocol was reverse-engineered from the I-NOVA Android app (v1.7).
 
 - **Up / Down / Stop** controls with configurable height limits
 - **3 programmable height presets** adjustable from Home Assistant
+- **Cover entity** with real position tracking (0% = down, 100% = up) and position commands
+- **Real-time current height** sensor from BLE notifications
+- **Device min/max limits** auto-detected from the lift controller
 - **Automatic BLE device discovery** (no need to hardcode the MAC address)
 - **WiFi captive portal** for easy setup (no hardcoded WiFi credentials)
-- **Cover entity** for native Home Assistant integration (cover card with Up/Down/Stop)
 - All settings **persist across reboots**
 
 ## Hardware Required
@@ -65,7 +67,7 @@ The ESP32 automatically scans for I-NOVA devices on boot. When found, it saves t
 ### Controls
 | Entity | Type | Description |
 |--------|------|-------------|
-| TV Lift | Cover | Up/Down/Stop cover card |
+| TV Lift | Cover | Up/Down/Stop with real position slider |
 | TV Lift Up | Button | Move to upper limit |
 | TV Lift Down | Button | Move to lower limit |
 | TV Lift Stop | Button | Stop movement |
@@ -76,8 +78,8 @@ The ESP32 automatically scans for I-NOVA devices on boot. When found, it saves t
 ### Configuration
 | Entity | Type | Default | Description |
 |--------|------|---------|-------------|
-| TV Lift Upper Limit | Number | 200 cm | Maximum height for Up button |
-| TV Lift Lower Limit | Number | 60 cm | Minimum height for Down button |
+| TV Lift Upper Limit | Number | device max | Maximum height for Up button (clamped to device max) |
+| TV Lift Lower Limit | Number | device min | Minimum height for Down button (clamped to device min) |
 | TV Lift Program 1 Height | Number | 93.5 cm | Program 1 target height |
 | TV Lift Program 2 Height | Number | 181 cm | Program 2 target height |
 | TV Lift Program 3 Height | Number | 130 cm | Program 3 target height |
@@ -85,9 +87,12 @@ The ESP32 automatically scans for I-NOVA devices on boot. When found, it saves t
 ### Status
 | Entity | Type | Description |
 |--------|------|-------------|
+| TV Lift Current Height | Sensor | Real-time height in cm |
 | TV Lift Connected | Binary Sensor | BLE connection status |
 | TV Lift Discovered Device | Text Sensor | Last discovered I-NOVA MAC |
 | TV Lift BLE Address | Text | Configured BLE MAC address |
+| TV Lift Device Min Height | Sensor | Device minimum height (diagnostic) |
+| TV Lift Device Max Height | Sensor | Device maximum height (diagnostic) |
 
 ## BLE Protocol Reference
 
@@ -132,7 +137,14 @@ A5 05 31 03 A7 E0
 
 ### Response format
 
-Responses start with `0x5A` and contain the current height, min/max limits, lock status, and error codes.
+Responses start with `0x5A`:
+
+| Type | Format | Description |
+|------|--------|-------------|
+| Device info | `5A 09 21 [cur_h] [cur_l] [min_h] [min_l] [max_h] [max_l]` | Current height + device limits |
+| Height update | `5A 06 xx [h_h] [h_l] [error]` | Real-time height during movement |
+
+All height values are `value / 10.0` to get cm.
 
 ## License
 

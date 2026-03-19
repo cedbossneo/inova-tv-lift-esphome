@@ -29,6 +29,7 @@ esphome:
   name: ${device_name}
   friendly_name: ${friendly_name}
   on_boot:
+
     priority: -100
     then:
       - lambda: |-
@@ -36,6 +37,8 @@ esphome:
           std::string mac = id(saved_mac);
           if (mac.length() == 17 && mac != "none") {
             ESP_LOGI("tv_lift", "Saved BLE MAC: %s — will connect", mac.c_str());
+            // Sync the text entity so HA shows the saved MAC
+            id(configured_mac).publish_state(mac);
             // Parse MAC string to uint64_t for ble_client
             uint64_t addr = 0;
             for (int i = 0; i < 6; i++) {
@@ -70,7 +73,7 @@ wifi:
 captive_portal:
 
 # WiFi provisioning: if no WiFi is configured or saved network is
-# unavailable, the ESP32 creates an AP named "TV Lift Setup".
+# unavailable, the ESP32 creates AP "TV Lift Setup".
 # Connect to it -> captive portal opens -> enter your WiFi credentials.
 # Credentials are saved and reused on subsequent boots.
 
@@ -113,11 +116,124 @@ ble_client:
         - logger.log: "TV Lift BLE connected"
         - lambda: |-
             id(tv_lift_connected) = true;
+        # Enable notifications on FEE1 to receive height updates & device info
+        - ble_client.ble_write:
+            id: tv_lift_ble
+            service_uuid: "0000fee0-0000-1000-8000-00805f9b34fb"
+            characteristic_uuid: "0000fee1-0000-1000-8000-00805f9b34fb"
+            value: [0x01, 0x00]
+        # Request device info (current height, min, max)
+        - delay: 500ms
+        - ble_client.ble_write:
+            id: tv_lift_ble
+            service_uuid: "0000fee0-0000-1000-8000-00805f9b34fb"
+            characteristic_uuid: "0000fee2-0000-1000-8000-00805f9b34fb"
+            value: [0xA5, 0x03, 0x21, 0x24]
     on_disconnect:
       then:
         - logger.log: "TV Lift BLE disconnected"
         - lambda: |-
             id(tv_lift_connected) = false;
+
+##############################################################
+# BLE Notify — parse responses from the lift controller
+# Notify characteristic: 0000FEE1
+#
+# Response formats (hex string):
+#   Device info (type 09 21):
+#     5A 09 21 [cur_h 2B] [min_h 2B] [max_h 2B] ...
+#     positions: 6-9=current, 10-13=min, 14-17=max (all value/10 = cm)
+#
+#   Current height update (type 06):
+#     5A 06 xx [height 2B] [error 1B] ...
+#     positions: 6-9=height (value/10 = cm), 10-11=error ("00"=OK)
+##############################################################
+sensor:
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: tv_lift_ble
+    id: tv_lift_notify
+    internal: true
+    service_uuid: "0000fee0-0000-1000-8000-00805f9b34fb"
+    characteristic_uuid: "0000fee1-0000-1000-8000-00805f9b34fb"
+    notify: true
+    lambda: |-
+      if (x.size() < 4) return NAN;
+      // All responses start with 0x5A
+      if (x[0] != 0x5A) return NAN;
+      uint8_t resp_len = x[1];
+      float cur = NAN;
+
+      if (resp_len == 0x09 && x.size() >= 9 && x[2] == 0x21) {
+        // Device info response: 5A 09 21 [cur_h] [cur_l] [min_h] [min_l] [max_h] [max_l]
+        cur = ((x[3] << 8) | x[4]) / 10.0f;
+        float dev_min = ((x[5] << 8) | x[6]) / 10.0f;
+        float dev_max = ((x[7] << 8) | x[8]) / 10.0f;
+        ESP_LOGI("tv_lift", "Device info: current=%.1f cm, min=%.1f cm, max=%.1f cm", cur, dev_min, dev_max);
+        id(device_min_height) = dev_min;
+        id(device_max_height) = dev_max;
+        id(device_min_sensor).publish_state(dev_min);
+        id(device_max_sensor).publish_state(dev_max);
+        // Set limit defaults to device limits if user hasn't changed them
+        if (id(height_upper_limit).state == 200.0f) {
+          auto call = id(height_upper_limit).make_call();
+          call.set_value(dev_max);
+          call.perform();
+        }
+        if (id(height_lower_limit).state == 60.0f) {
+          auto call = id(height_lower_limit).make_call();
+          call.set_value(dev_min);
+          call.perform();
+        }
+      } else if (resp_len == 0x06 && x.size() >= 6) {
+        // Current height update: 5A 06 xx [h_h] [h_l] [error]
+        cur = ((x[3] << 8) | x[4]) / 10.0f;
+        uint8_t err = x[5];
+        if (err != 0x00) {
+          ESP_LOGW("tv_lift", "Height update: %.1f cm, error code: %02X", cur, err);
+        }
+      }
+
+      if (!std::isnan(cur)) {
+        id(current_height).publish_state(cur);
+        // Update cover position: 0.0 = lower limit, 1.0 = upper limit
+        float lo = id(height_lower_limit).state;
+        float hi = id(height_upper_limit).state;
+        if (hi > lo) {
+          float pos = (cur - lo) / (hi - lo);
+          pos = std::max(0.0f, std::min(1.0f, pos));
+          auto call = id(tv_lift_cover).make_call();
+          call.set_position(pos);
+          call.perform();
+        }
+      }
+
+      return cur;
+
+  - platform: template
+    name: "TV Lift Current Height"
+    id: current_height
+    icon: "mdi:arrow-expand-vertical"
+    unit_of_measurement: "cm"
+    accuracy_decimals: 1
+    device_class: distance
+    state_class: measurement
+
+  - platform: template
+    name: "TV Lift Device Min Height"
+    id: device_min_sensor
+    icon: "mdi:arrow-collapse-down"
+    unit_of_measurement: "cm"
+    accuracy_decimals: 1
+    entity_category: diagnostic
+
+  - platform: template
+    name: "TV Lift Device Max Height"
+    id: device_max_sensor
+    icon: "mdi:arrow-collapse-up"
+    unit_of_measurement: "cm"
+    accuracy_decimals: 1
+    entity_category: diagnostic
 
 ##############################################################
 # Global state
@@ -135,6 +251,14 @@ globals:
     type: std::string
     restore_value: true
     initial_value: '"none"'
+  - id: device_min_height
+    type: float
+    restore_value: false
+    initial_value: "60"
+  - id: device_max_height
+    type: float
+    restore_value: false
+    initial_value: "200"
 
 ##############################################################
 # Text entities for BLE device management
@@ -299,6 +423,16 @@ number:
     initial_value: 200
     restore_value: true
     optimistic: true
+    set_action:
+      - lambda: |-
+          // Clamp to device max if known
+          float clamped = std::min(x, id(device_max_height));
+          if (clamped != x) {
+            ESP_LOGW("tv_lift", "Upper limit clamped to device max: %.1f cm", clamped);
+            auto call = id(height_upper_limit).make_call();
+            call.set_value(clamped);
+            call.perform();
+          }
 
   - platform: template
     name: "TV Lift Lower Limit"
@@ -311,6 +445,16 @@ number:
     initial_value: 60
     restore_value: true
     optimistic: true
+    set_action:
+      - lambda: |-
+          // Clamp to device min if known
+          float clamped = std::max(x, id(device_min_height));
+          if (clamped != x) {
+            ESP_LOGW("tv_lift", "Lower limit clamped to device min: %.1f cm", clamped);
+            auto call = id(height_lower_limit).make_call();
+            call.set_value(clamped);
+            call.perform();
+          }
 
   - platform: template
     name: "TV Lift Program 1 Height"
@@ -349,15 +493,34 @@ number:
     optimistic: true
 
 ##############################################################
-# Cover entity — gives HA a proper cover card
-# with Up/Down/Stop controls
+# Cover entity — real position based on current height
+# 0% = lower limit (closed/down), 100% = upper limit (open/up)
+# Supports position commands: maps % to height between limits
 ##############################################################
 cover:
   - platform: template
     name: "TV Lift"
     id: tv_lift_cover
     device_class: blind
-    optimistic: true
+    has_position: true
+    position_action:
+      # pos is 0.0 (closed) to 1.0 (open)
+      - lambda: |-
+          float lo = id(height_lower_limit).state;
+          float hi = id(height_upper_limit).state;
+          float height = lo + pos * (hi - lo);
+          id(target_height) = height;
+          ESP_LOGI("tv_lift", "Cover position %.0f%% -> %.1f cm", pos * 100, height);
+      - ble_client.ble_write:
+          id: tv_lift_ble
+          service_uuid: "0000fee0-0000-1000-8000-00805f9b34fb"
+          characteristic_uuid: "0000fee2-0000-1000-8000-00805f9b34fb"
+          value: !lambda |-
+            int val = (int)(id(target_height) * 10);
+            uint8_t hh = (val >> 8) & 0xFF;
+            uint8_t ll = val & 0xFF;
+            uint8_t cs = (0x05 + 0x31 + hh + ll) & 0xFF;
+            return {0xA5, 0x05, 0x31, hh, ll, cs};
     open_action:
       - button.press: btn_up
     close_action:
