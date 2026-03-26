@@ -196,15 +196,15 @@ sensor:
 
       if (!std::isnan(cur)) {
         id(current_height).publish_state(cur);
-        // Update cover position: 0.0 = lower limit, 1.0 = upper limit
+        // Update cover position display without triggering position_action
+        // (make_call + set_position would re-send a GOTO command, creating a feedback loop)
         float lo = id(height_lower_limit).state;
         float hi = id(height_upper_limit).state;
         if (hi > lo) {
           float pos = (cur - lo) / (hi - lo);
           pos = std::max(0.0f, std::min(1.0f, pos));
-          auto call = id(tv_lift_cover).make_call();
-          call.set_position(pos);
-          call.perform();
+          id(tv_lift_cover).position = pos;
+          id(tv_lift_cover).publish_state();
         }
       }
 
